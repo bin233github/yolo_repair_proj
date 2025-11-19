@@ -14,7 +14,7 @@ import torch.optim as optim
 from torchvision.ops import roi_align
 from tqdm import tqdm
 import numpy as np
-from .utils.yolo_hooks import load_yolov8_model, find_cls_1x1_convs, InputFeatHook, choose_p3_by_resolution, try_unfreeze_stem_of_cls_conv, freeze_module
+from .utils.yolo_hooks import load_yolov8_model, find_cls_1x1_convs, InputFeatHook, choose_p3_by_resolution, try_unfreeze_stem_of_cls_conv, freeze_module, unfreeze_module
 from .utils.data import load_data_yaml, read_id_list, make_loader
 from .utils.geometry import to_tensor_chw_rgb01, boxes_to_letterboxed_xyxy
 
@@ -58,7 +58,7 @@ class StageAFeatureRepairRunner:
         self.nc = nc
 
         self.cls_convs = find_cls_1x1_convs(self.model, nc)
-        self.hooks = [InputFeatHook(conv) for (_,conv) in self.cls_convs]
+        self.hooks = [InputFeatHook(conv, detach=False) for (_,conv) in self.cls_convs]
 
         # 跑一次前向拿到各尺度特征图尺寸
         # 随便抽一张 split 图
@@ -81,8 +81,9 @@ class StageAFeatureRepairRunner:
         freeze_module(self.model)
         ok = try_unfreeze_stem_of_cls_conv(self.model, self.target_conv_name)
         if not ok:
-            print("[StageA][Warn] 未能自动定位前置 stem，仅解冻分类输入的 BN/Conv 可能会失败；"
-                  "如需更强修复，请在 yolo_hooks.try_unfreeze_stem_of_cls_conv 中按你的模型结构微调逻辑。")
+            print("[StageA][Warn] 未能自动定位前置 stem，将回退到解冻分类 1×1 Conv 所在模块。")
+            if not self._unfreeze_target_parent():
+                unfreeze_module(self.target_cls_conv)
 
         # 4) 构建数据加载器（按 id 列表采样）
         succ_ids = read_id_list(cfg['paths']['success_ids'])
@@ -138,6 +139,16 @@ class StageAFeatureRepairRunner:
         p0 = roi_align(fmap_before, rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)
         p1 = roi_align(fmap_after,  rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)
         return torch.nn.functional.smooth_l1_loss(p1, p0)
+
+    def _unfreeze_target_parent(self):
+        parent = self.model
+        parts = self.target_conv_name.split('.')
+        for p in parts[:-1]:
+            if not hasattr(parent, p):
+                return False
+            parent = getattr(parent, p)
+        unfreeze_module(parent)
+        return True
 
     def train(self, epochs=5, alpha=1.0, beta=0.1, save_ckpt='runs_repair/stageA_feature_repaired.safetensors'):
         print("[StageA] 开始中间层可信修复训练...")

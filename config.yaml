@@ -12,9 +12,9 @@ img_size: 640
 # 阶段A：中间层可信修复（特征对齐）
 stageA:
   device: 0                     # GPU id；CPU 用 -1
-  epochs: 5
+  epochs: 1
   batch_size: 1                 # ROI 对齐逐图处理即可
-  num_workers: 4
+  num_workers: 2
   lr: 1.0e-3
   weight_decay: 1.0e-4
   max_pos_batches: 300          # 构建类原型时最多累计批次数

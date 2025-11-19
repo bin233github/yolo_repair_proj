@@ -35,14 +35,19 @@ def find_cls_1x1_convs(model, num_classes):
 class InputFeatHook:
     """
     注册到分类 1×1 Conv 上，抓取其 **输入特征图**（即 conv 前的张量）。
+    detach=False 时保留梯度，detach=True 时仅用于推理采样。
     """
-    def __init__(self, conv_module: nn.Conv2d):
+    def __init__(self, conv_module: nn.Conv2d, detach: bool = True):
         self.last_in = None
+        self.detach = detach
         self.h = conv_module.register_forward_hook(self._hook)
 
     def _hook(self, m, inp, out):
-        # inp 是一个 tuple，仅取第一个
-        self.last_in = inp[0].detach()
+        feat = inp[0]
+        self.last_in = feat.detach() if self.detach else feat
+
+    def set_detach(self, flag: bool):
+        self.detach = flag
 
     def close(self):
         self.h.remove()

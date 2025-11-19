@@ -11,8 +11,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 def load_data_yaml(path_yaml):
+    path_yaml = Path(path_yaml)
     data = yaml.safe_load(open(path_yaml,'r',encoding='utf-8'))
     root = Path(data['path'])
+    if not root.is_absolute():
+        root = (path_yaml.parent / root).resolve()
     names = data['names'] if isinstance(data['names'], list) else [data['names'][k] for k in sorted(data['names'].keys(), key=int)]
     return dict(
         root=root,

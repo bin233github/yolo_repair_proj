@@ -1,0 +1,12 @@
+{
+  "status": "optimal",
+  "num_fix": 477,
+  "num_keep": 377,
+  "m_fix": 0.6,
+  "m_keep": 0.2,
+  "l1_reg": 1.0,
+  "topk_out_channels": 16,
+  "target_conv_name": "model.22.cv3.0.2",
+  "norm1_dW": 49.00069046020508,
+  "norm1_db": 1.7665021667667702e-09
+}

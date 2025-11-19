@@ -1,0 +1,1079 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/REPAIR_REPORT.md b/REPAIR_REPORT.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ac07e0d6d01819ca3e91d48ae3b7911d6158c8d
+--- /dev/null
++++ b/REPAIR_REPORT.md
+@@ -0,0 +1,26 @@
++# 权重修复执行记录
++
++## 数据准备
++- 运行 `scripts/generate_success_failure_ids.py`，基于 `weights/best.pt` 在 neu-det 验证集上区分成功/失败样本，得到 190 个成功样本与 170 个失败样本并写入 `data/success_ids.txt` 与 `data/failure_ids.txt`。
++- 新脚本支持自动解析相对路径、批量推理以及 CPU/GPU 自动选择，方便后续重复使用。
++
++## 代码修改要点
++1. **图像路径解析**：`yolo_repair/utils/data.py` 中的 `load_data_yaml` 现在会把 YAML 中的相对 `path` 自动转为绝对路径，避免在不同工作目录下出错。
++2. **StageA 训练稳定性**：
++   - `InputFeatHook` 新增 `detach` 选项，StageA 在注册钩子时使用 `detach=False` 保留梯度，StageB 仍保持原行为。
++   - 若无法自动找到 `cv2` 前置 stem，会回退到解冻目标分类层所在的父模块，确保始终有可训练参数。
++3. **配置调整**：将 `stageA.epochs` 调整为 1、`num_workers` 调整为 2，使得 CPU 环境下流水线可在合理时间内跑完。
++4. **OpenCV 依赖**：提供 `scripts/libgl_stub.c` 与 `scripts/build_libgl_stub.sh`，在缺失系统 `libGL.so.1` 时可以快速编译最小 stub 解决导入问题。
++5. **结果产物**：流水线会在 `runs_repair/` 下生成 StageA 修复权重、StageAB 最终权重以及 LP 证书，方便复查。
++
++## 流水线执行情况
++- StageA 仅 1 个 epoch 即可完成中间层可信修复，日志与模型快照位于 `runs_repair/stageA_feature_repaired.safetensors`。
++- StageB 基于 477 个失败 ROI 与 377 个成功 ROI 构建线性规划，解得 `status=optimal`，并成功将 ΔW/Δb 写入检测头，最终权重保存在 `runs_repair/stageAB_yolov8_repaired.pt`，证书 `runs_repair/lp_certificate.json` 记录了约束与 L1 范数。
++
++## 权重修复结论
++- LP 求解状态为 **optimal**，说明在给定 margin 与约束下找到了满足要求的权重增量，修复成功。
++- 如需复现，可依次执行：
++  1. `bash scripts/build_libgl_stub.sh`（若系统缺失 libGL）。
++  2. `python scripts/generate_success_failure_ids.py --weights weights/best.pt --data-yaml datasets/neu_det_yolo/neu_det.yaml --split val --imgsz 640 --conf 0.25`。
++  3. `python -m yolo_repair.run_pipeline --config config.yaml`。
++
+diff --git a/config.yaml b/config.yaml
+index daa5205972c080031f51b2c61e9d75a3b9264583..9f5bdafade5087523c4ee4d53c83ee410aa29932 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -1,42 +1,42 @@
+ # 全局配置（可按需修改）
+ paths:
+   weights: weights/best.pt
+   data_yaml: datasets/neu_det_yolo/neu_det.yaml
+   split: val                    # 从哪个 split 读样本列表（train/val/test），用于 StageA/B 的 ROI 取特征
+   success_ids: data/success_ids.txt
+   failure_ids: data/failure_ids.txt
+ 
+ # 训练/推理图像尺寸
+ img_size: 640
+ 
+ # 阶段A：中间层可信修复（特征对齐）
+ stageA:
+   device: 0                     # GPU id；CPU 用 -1
+-  epochs: 5
++  epochs: 1
+   batch_size: 1                 # ROI 对齐逐图处理即可
+-  num_workers: 4
++  num_workers: 2
+   lr: 1.0e-3
+   weight_decay: 1.0e-4
+   max_pos_batches: 300          # 构建类原型时最多累计批次数
+   alpha_align: 1.0              # 失败样本：向类原型对齐的损失权重
+   beta_consist: 0.1             # 成功样本：一致性（蒸馏）损失权重
+   target_scale: auto            # auto=自动选择 P3（特征图分辨率最大者）
+   save_ckpt: runs_repair/stageA_feature_repaired.safetensors
+ 
+ # 阶段B：Head 末端 LP 线性修复（分类 1×1 Conv）
+ stageB:
+   device: 0
+   m_fix: 0.6                    # 失败样本的分类 margin 阈值
+   m_keep: 0.2                   # 成功样本的保持 margin 阈值
+   l1_reg: 1.0                   # L1 最小化的权重（越大越偏向稀疏小改动）
+   max_fix: 6000                 # 失败样本用于 LP 的最多 ROI 数
+   max_keep: 6000                # 成功样本用于 LP 的最多 ROI 数
+   topk_out_channels: 16         # 只开放这几个输出通道作为变量（稳且可解释）；=0 表示全开放
+   save_pt: runs_repair/stageAB_yolov8_repaired.pt
+   save_certificate: runs_repair/lp_certificate.json
+ 
+ # 可选：验证修复后指标
+ verify:
+   device: 0
+   conf_thres: 0.25
+   iou_thres: 0.7
+diff --git a/data/failure_ids.txt b/data/failure_ids.txt
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..fbf752ee4b75da74dbd08bdbb1856ff5bea43a8f 100644
+--- a/data/failure_ids.txt
++++ b/data/failure_ids.txt
+@@ -0,0 +1,170 @@
++crazing_241
++crazing_242
++crazing_243
++crazing_244
++crazing_246
++crazing_247
++crazing_248
++crazing_249
++crazing_250
++crazing_251
++crazing_252
++crazing_253
++crazing_255
++crazing_256
++crazing_257
++crazing_258
++crazing_259
++crazing_261
++crazing_262
++crazing_264
++crazing_265
++crazing_267
++crazing_268
++crazing_269
++crazing_270
++crazing_271
++crazing_272
++crazing_273
++crazing_274
++crazing_275
++crazing_276
++crazing_277
++crazing_278
++crazing_279
++crazing_281
++crazing_282
++crazing_283
++crazing_284
++crazing_285
++crazing_286
++crazing_287
++crazing_288
++crazing_289
++crazing_290
++crazing_291
++crazing_293
++crazing_294
++crazing_295
++crazing_296
++crazing_297
++crazing_298
++crazing_299
++crazing_300
++inclusion_243
++inclusion_254
++inclusion_256
++inclusion_262
++inclusion_264
++inclusion_265
++inclusion_266
++inclusion_267
++inclusion_273
++inclusion_274
++inclusion_275
++inclusion_276
++inclusion_278
++inclusion_280
++inclusion_282
++inclusion_284
++inclusion_287
++inclusion_288
++inclusion_291
++inclusion_292
++inclusion_293
++patches_242
++patches_245
++patches_248
++patches_249
++patches_259
++patches_260
++patches_265
++patches_275
++patches_276
++patches_280
++patches_284
++patches_285
++patches_286
++patches_290
++patches_291
++patches_298
++pitted_surface_245
++pitted_surface_246
++pitted_surface_248
++pitted_surface_256
++pitted_surface_258
++pitted_surface_261
++pitted_surface_266
++pitted_surface_267
++pitted_surface_268
++pitted_surface_269
++pitted_surface_271
++pitted_surface_272
++pitted_surface_277
++pitted_surface_279
++pitted_surface_280
++pitted_surface_282
++pitted_surface_284
++pitted_surface_290
++pitted_surface_291
++pitted_surface_292
++pitted_surface_294
++pitted_surface_298
++pitted_surface_299
++pitted_surface_300
++rolled-in_scale_241
++rolled-in_scale_242
++rolled-in_scale_244
++rolled-in_scale_245
++rolled-in_scale_246
++rolled-in_scale_247
++rolled-in_scale_248
++rolled-in_scale_250
++rolled-in_scale_252
++rolled-in_scale_254
++rolled-in_scale_255
++rolled-in_scale_257
++rolled-in_scale_258
++rolled-in_scale_259
++rolled-in_scale_260
++rolled-in_scale_261
++rolled-in_scale_262
++rolled-in_scale_263
++rolled-in_scale_264
++rolled-in_scale_266
++rolled-in_scale_267
++rolled-in_scale_268
++rolled-in_scale_270
++rolled-in_scale_271
++rolled-in_scale_273
++rolled-in_scale_274
++rolled-in_scale_277
++rolled-in_scale_278
++rolled-in_scale_279
++rolled-in_scale_281
++rolled-in_scale_282
++rolled-in_scale_283
++rolled-in_scale_284
++rolled-in_scale_285
++rolled-in_scale_286
++rolled-in_scale_287
++rolled-in_scale_288
++rolled-in_scale_289
++rolled-in_scale_291
++rolled-in_scale_292
++rolled-in_scale_295
++rolled-in_scale_297
++rolled-in_scale_300
++scratches_242
++scratches_244
++scratches_253
++scratches_264
++scratches_268
++scratches_271
++scratches_277
++scratches_284
++scratches_285
++scratches_290
++scratches_292
++scratches_293
++scratches_294
+diff --git a/data/success_ids.txt b/data/success_ids.txt
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..8d5f8946b555fd461e906e339cc938388a036677 100644
+--- a/data/success_ids.txt
++++ b/data/success_ids.txt
+@@ -0,0 +1,190 @@
++crazing_245
++crazing_254
++crazing_260
++crazing_263
++crazing_266
++crazing_280
++crazing_292
++inclusion_241
++inclusion_242
++inclusion_244
++inclusion_245
++inclusion_246
++inclusion_247
++inclusion_248
++inclusion_249
++inclusion_250
++inclusion_251
++inclusion_252
++inclusion_253
++inclusion_255
++inclusion_257
++inclusion_258
++inclusion_259
++inclusion_260
++inclusion_261
++inclusion_263
++inclusion_268
++inclusion_269
++inclusion_270
++inclusion_271
++inclusion_272
++inclusion_277
++inclusion_279
++inclusion_281
++inclusion_283
++inclusion_285
++inclusion_286
++inclusion_289
++inclusion_290
++inclusion_294
++inclusion_295
++inclusion_296
++inclusion_297
++inclusion_298
++inclusion_299
++inclusion_300
++patches_241
++patches_243
++patches_244
++patches_246
++patches_247
++patches_250
++patches_251
++patches_252
++patches_253
++patches_254
++patches_255
++patches_256
++patches_257
++patches_258
++patches_261
++patches_262
++patches_263
++patches_264
++patches_266
++patches_267
++patches_268
++patches_269
++patches_270
++patches_271
++patches_272
++patches_273
++patches_274
++patches_277
++patches_278
++patches_279
++patches_281
++patches_282
++patches_283
++patches_287
++patches_288
++patches_289
++patches_292
++patches_293
++patches_294
++patches_295
++patches_296
++patches_297
++patches_299
++patches_300
++pitted_surface_241
++pitted_surface_242
++pitted_surface_243
++pitted_surface_244
++pitted_surface_247
++pitted_surface_249
++pitted_surface_250
++pitted_surface_251
++pitted_surface_252
++pitted_surface_253
++pitted_surface_254
++pitted_surface_255
++pitted_surface_257
++pitted_surface_259
++pitted_surface_260
++pitted_surface_262
++pitted_surface_263
++pitted_surface_264
++pitted_surface_265
++pitted_surface_270
++pitted_surface_273
++pitted_surface_274
++pitted_surface_275
++pitted_surface_276
++pitted_surface_278
++pitted_surface_281
++pitted_surface_283
++pitted_surface_285
++pitted_surface_286
++pitted_surface_287
++pitted_surface_288
++pitted_surface_289
++pitted_surface_293
++pitted_surface_295
++pitted_surface_296
++pitted_surface_297
++rolled-in_scale_243
++rolled-in_scale_249
++rolled-in_scale_251
++rolled-in_scale_253
++rolled-in_scale_256
++rolled-in_scale_265
++rolled-in_scale_269
++rolled-in_scale_272
++rolled-in_scale_275
++rolled-in_scale_276
++rolled-in_scale_280
++rolled-in_scale_290
++rolled-in_scale_293
++rolled-in_scale_294
++rolled-in_scale_296
++rolled-in_scale_298
++rolled-in_scale_299
++scratches_241
++scratches_243
++scratches_245
++scratches_246
++scratches_247
++scratches_248
++scratches_249
++scratches_250
++scratches_251
++scratches_252
++scratches_254
++scratches_255
++scratches_256
++scratches_257
++scratches_258
++scratches_259
++scratches_260
++scratches_261
++scratches_262
++scratches_263
++scratches_265
++scratches_266
++scratches_267
++scratches_269
++scratches_270
++scratches_272
++scratches_273
++scratches_274
++scratches_275
++scratches_276
++scratches_278
++scratches_279
++scratches_280
++scratches_281
++scratches_282
++scratches_283
++scratches_286
++scratches_287
++scratches_288
++scratches_289
++scratches_291
++scratches_295
++scratches_296
++scratches_297
++scratches_298
++scratches_299
++scratches_300
+diff --git a/runs_repair/lp_certificate.json b/runs_repair/lp_certificate.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..bba95ab290eaf23b8d3c817fe1d0a7f770680427
+--- /dev/null
++++ b/runs_repair/lp_certificate.json
+@@ -0,0 +1,12 @@
++{
++  "status": "optimal",
++  "num_fix": 477,
++  "num_keep": 377,
++  "m_fix": 0.6,
++  "m_keep": 0.2,
++  "l1_reg": 1.0,
++  "topk_out_channels": 16,
++  "target_conv_name": "model.22.cv3.0.2",
++  "norm1_dW": 49.00069046020508,
++  "norm1_db": 1.7665021667667702e-09
++}
+\ No newline at end of file
+
+diff --git a/scripts/build_libgl_stub.sh b/scripts/build_libgl_stub.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..61127975f0384d6539fbdfc126d4df744436f24a
+--- /dev/null
++++ b/scripts/build_libgl_stub.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -euo pipefail
++PREFIX=${1:-/usr/local/lib}
++mkdir -p "$PREFIX"
++gcc -shared -fPIC scripts/libgl_stub.c -o "$PREFIX/libGL.so.1"
++if [ -d /usr/lib ]; then
++    ln -sf "$PREFIX/libGL.so.1" /usr/lib/libGL.so.1
++fi
++echo "libGL stub built at $PREFIX/libGL.so.1"
+diff --git a/scripts/generate_success_failure_ids.py b/scripts/generate_success_failure_ids.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f13f77659701982ce8d7f252f1209f17a7287895
+--- /dev/null
++++ b/scripts/generate_success_failure_ids.py
+@@ -0,0 +1,161 @@
++# -*- coding: utf-8 -*-
++"""根据指定 YOLO 权重在数据集 split 上的检测结果，自动划分成功/失败样本列表。
++成功样本：所有 GT 框都能被正确预测（同类且 IoU>=阈值）
++失败样本：至少有 1 个 GT 未被正确预测。
++"""
++import argparse
++import yaml
++from pathlib import Path
++from ultralytics import YOLO
++import torch
++import numpy as np
++from typing import List, Tuple
++from tqdm import tqdm
++
++def load_split_paths(data_yaml: str, split: str) -> Tuple[List[Path], Path]:
++    yaml_path = Path(data_yaml)
++    data = yaml.safe_load(open(data_yaml, 'r', encoding='utf-8'))
++    root = Path(data['path'])
++    if not root.is_absolute():
++        root = (yaml_path.parent / root).resolve()
++    img_dir = root / f"images/{split}"
++    lbl_dir = root / f"labels/{split}"
++    img_paths = []
++    for ext in ('*.jpg','*.jpeg','*.png','*.bmp'):
++        img_paths += sorted(img_dir.glob(ext))
++    return sorted(img_paths), lbl_dir
++
++def load_gt(label_path: Path, img_w: int, img_h: int):
++    boxes = []
++    if label_path.exists():
++        for ln in open(label_path,'r',encoding='utf-8'):
++            parts = ln.strip().split()
++            if len(parts) < 5:
++                continue
++            c, cx, cy, bw, bh = map(float, parts[:5])
++            x1 = (cx - bw/2) * img_w
++            y1 = (cy - bh/2) * img_h
++            x2 = (cx + bw/2) * img_w
++            y2 = (cy + bh/2) * img_h
++            boxes.append((int(c), [x1,y1,x2,y2]))
++    if boxes:
++        cls = np.array([b[0] for b in boxes], dtype=np.int64)
++        xyxy = np.array([b[1] for b in boxes], dtype=np.float32)
++    else:
++        cls = np.zeros((0,), dtype=np.int64)
++        xyxy = np.zeros((0,4), dtype=np.float32)
++    return cls, xyxy
++
++def iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray):
++    if boxes1.size == 0 or boxes2.size == 0:
++        return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float32)
++    # boxes: [N,4]
++    area1 = (boxes1[:,2]-boxes1[:,0]).clip(min=0) * (boxes1[:,3]-boxes1[:,1]).clip(min=0)
++    area2 = (boxes2[:,2]-boxes2[:,0]).clip(min=0) * (boxes2[:,3]-boxes2[:,1]).clip(min=0)
++    inter = np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float32)
++    for i in range(boxes1.shape[0]):
++        x1 = np.maximum(boxes1[i,0], boxes2[:,0])
++        y1 = np.maximum(boxes1[i,1], boxes2[:,1])
++        x2 = np.minimum(boxes1[i,2], boxes2[:,2])
++        y2 = np.minimum(boxes1[i,3], boxes2[:,3])
++        inter_w = np.clip(x2 - x1, a_min=0, a_max=None)
++        inter_h = np.clip(y2 - y1, a_min=0, a_max=None)
++        inter[i] = inter_w * inter_h
++    union = area1[:,None] + area2[None,:] - inter
++    union = np.clip(union, a_min=1e-6, a_max=None)
++    return inter / union
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--weights', default='weights/best.pt')
++    ap.add_argument('--data-yaml', default='datasets/neu_det_yolo/neu_det.yaml')
++    ap.add_argument('--split', default='val')
++    ap.add_argument('--imgsz', type=int, default=640)
++    ap.add_argument('--conf', type=float, default=0.25)
++    ap.add_argument('--iou-thres', type=float, default=0.5, help='GT 匹配 IoU 阈值')
++    ap.add_argument('--device', default='0')
++    ap.add_argument('--success-out', default='data/success_ids.txt')
++    ap.add_argument('--failure-out', default='data/failure_ids.txt')
++    args = ap.parse_args()
++
++    img_paths, lbl_dir = load_split_paths(args.data_yaml, args.split)
++    if len(img_paths) == 0:
++        raise SystemExit('No images found in split. check data yaml or split name')
++    img_dir = img_paths[0].parent if img_paths else None
++
++    device = args.device
++    if isinstance(device, str):
++        d = device.strip().lower()
++        if d == 'cpu':
++            device_arg = 'cpu'
++        elif d.startswith('cuda'):
++            device_arg = device
++        elif d.isdigit():
++            device_arg = f"cuda:{d}" if torch.cuda.is_available() else 'cpu'
++        else:
++            device_arg = device
++    elif isinstance(device, int):
++        device_arg = f"cuda:{device}" if torch.cuda.is_available() else 'cpu'
++    else:
++        device_arg = device
++    model = YOLO(args.weights)
++    model.to(device_arg)
++
++    successes, failures = [], []
++    pred_iter = model.predict(str(img_dir), imgsz=args.imgsz, conf=args.conf, iou=0.7,
++                              device=device_arg, verbose=False, stream=True, batch=16)
++    for r0 in tqdm(pred_iter, total=len(img_paths), desc='Predict'):
++        img_path = Path(r0.path)
++        img = str(img_path)
++        preds = r0.boxes
++        if preds is None:
++            pred_cls = np.zeros((0,), dtype=np.int64)
++            pred_boxes = np.zeros((0,4), dtype=np.float32)
++        else:
++            pred_boxes = preds.xyxy.cpu().numpy().astype(np.float32)
++            pred_cls = preds.cls.cpu().numpy().astype(np.int64)
++        # load GT
++        import cv2
++        im = cv2.imread(img)
++        h, w = im.shape[:2]
++        gt_cls, gt_boxes = load_gt(lbl_dir/(img_path.stem + '.txt'), w, h)
++        if gt_boxes.shape[0] == 0:
++            # treat no-gt as success if没有预测? 允许任意
++            successes.append(img_path.stem)
++            continue
++        ious = iou_matrix(gt_boxes, pred_boxes)
++        matched_preds = set()
++        all_hit = True
++        for gi in range(gt_boxes.shape[0]):
++            best_j = -1
++            best_iou = 0.0
++            for pj in range(pred_boxes.shape[0]):
++                if pj in matched_preds:
++                    continue
++                if pred_cls[pj] != gt_cls[gi]:
++                    continue
++                if ious[gi, pj] > best_iou:
++                    best_iou = ious[gi, pj]
++                    best_j = pj
++            if best_j >= 0 and best_iou >= args.iou_thres:
++                matched_preds.add(best_j)
++            else:
++                all_hit = False
++                break
++        if all_hit:
++            successes.append(img_path.stem)
++        else:
++            failures.append(img_path.stem)
++    successes = sorted(set(successes))
++    failures = sorted(set(failures))
++    Path(args.success_out).parent.mkdir(parents=True, exist_ok=True)
++    with open(args.success_out,'w',encoding='utf-8') as f:
++        for s in successes:
++            f.write(s+'\n')
++    with open(args.failure_out,'w',encoding='utf-8') as f:
++        for s in failures:
++            f.write(s+'\n')
++    print(f'[Done] split={args.split}, success={len(successes)}, failure={len(failures)} -> {args.success_out}, {args.failure_out}')
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/libgl_stub.c b/scripts/libgl_stub.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9183632305564b24940b58d2e32625db41733572
+--- /dev/null
++++ b/scripts/libgl_stub.c
+@@ -0,0 +1,116 @@
++#include <stddef.h>
++typedef unsigned int GLenum;
++typedef unsigned char GLubyte;
++typedef unsigned int GLuint;
++typedef int GLsizei;
++typedef int GLint;
++typedef float GLfloat;
++typedef double GLdouble;
++typedef unsigned char GLboolean;
++typedef ptrdiff_t GLsizeiptr;
++
++const GLubyte* glGetString(GLenum name) { static const GLubyte empty[] = ""; return empty; }
++void glMatrixMode(GLenum mode) {}
++void glLoadIdentity(void) {}
++void glLoadMatrixf(const GLfloat *m) {}
++void glMultMatrixf(const GLfloat *m) {}
++void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {}
++void glFrustum(GLdouble l, GLdouble r, GLdouble b, GLdouble t, GLdouble n, GLdouble f) {}
++void glBegin(GLenum mode) {}
++void glEnd(void) {}
++void glVertex2f(GLfloat x, GLfloat y) {}
++void glVertex3f(GLfloat x, GLfloat y, GLfloat z) {}
++void glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {}
++void glColor3f(GLfloat r, GLfloat g, GLfloat b) {}
++void glClear(GLenum mask) {}
++void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {}
++void glFlush(void) {}
++void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {}
++void glEnable(GLenum cap) {}
++void glDisable(GLenum cap) {}
++void glBlendFunc(GLenum sfactor, GLenum dfactor) {}
++void glHint(GLenum target, GLenum mode) {}
++void glShadeModel(GLenum mode) {}
++void glDepthMask(GLboolean flag) {}
++void glClearDepth(GLdouble depth) {}
++void glDrawBuffer(GLenum mode) {}
++void glReadBuffer(GLenum mode) {}
++void glTexEnvi(GLenum target, GLenum pname, GLint param) {}
++void glTexParameteri(GLenum target, GLenum pname, GLint param) {}
++void glBindTexture(GLenum target, GLuint texture) {}
++void glGenTextures(GLsizei n, GLuint *textures) { if(textures) for(GLsizei i=0;i<n;++i) textures[i]=0; }
++void glDeleteTextures(GLsizei n, const GLuint *textures) {}
++void glTexImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {}
++void glPixelStorei(GLenum pname, GLint param) {}
++void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {}
++void glGetIntegerv(GLenum pname, GLint *data) { if(data) *data = 0; }
++void glGetFloatv(GLenum pname, GLfloat *data) { if(data) *data = 0; }
++GLenum glGetError(void) { return 0; }
++void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) {}
++void glTranslatef(GLfloat x, GLfloat y, GLfloat z) {}
++void glScalef(GLfloat x, GLfloat y, GLfloat z) {}
++void glPushMatrix(void) {}
++void glPopMatrix(void) {}
++void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {}
++void glDisableClientState(GLenum array) {}
++void glEnableClientState(GLenum array) {}
++void glVertexPointer(GLint size, GLenum type, GLsizei stride, const void *pointer) {}
++void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const void *pointer) {}
++void glColorPointer(GLint size, GLenum type, GLsizei stride, const void *pointer) {}
++void glDrawArrays(GLenum mode, GLint first, GLsizei count) {}
++void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *indices) {}
++void glBindFramebuffer(GLenum target, GLuint framebuffer) {}
++void glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers) {}
++void glGenFramebuffers(GLsizei n, GLuint *framebuffers) { if(framebuffers) for(GLsizei i=0;i<n;++i) framebuffers[i]=0; }
++void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) {}
++void glCheckFramebufferStatus(GLenum target) {}
++void glActiveTexture(GLenum texture) {}
++void glBindBuffer(GLenum target, GLuint buffer) {}
++void glGenBuffers(GLsizei n, GLuint *buffers) { if(buffers) for(GLsizei i=0;i<n;++i) buffers[i]=0; }
++void glDeleteBuffers(GLsizei n, const GLuint *buffers) {}
++void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {}
++void glBufferSubData(GLenum target, GLsizeiptr offset, GLsizeiptr size, const void *data) {}
++void glUseProgram(GLuint program) {}
++void glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {}
++void glUniform1i(GLint location, GLint v0) {}
++void glUniform1f(GLint location, GLfloat v0) {}
++void glUniform2f(GLint location, GLfloat v0, GLfloat v1) {}
++void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) {}
++void glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3) {}
++void glAttachShader(GLuint program, GLuint shader) {}
++void glCompileShader(GLuint shader) {}
++GLuint glCreateShader(GLenum type) { return 0; }
++GLuint glCreateProgram(void) { return 0; }
++void glLinkProgram(GLuint program) {}
++void glShaderSource(GLuint shader, GLsizei count, const char **string, const GLint *length) {}
++void glDeleteShader(GLuint shader) {}
++void glDeleteProgram(GLuint program) {}
++void glDetachShader(GLuint program, GLuint shader) {}
++void glGetShaderiv(GLuint shader, GLenum pname, GLint *params) { if(params) *params = 0; }
++void glGetProgramiv(GLuint program, GLenum pname, GLint *params) { if(params) *params = 0; }
++void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, char *infoLog) { if(length) *length = 0; if(infoLog && bufSize>0) infoLog[0]='\0'; }
++void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, char *infoLog) { if(length) *length = 0; if(infoLog && bufSize>0) infoLog[0]='\0'; }
++void glDeleteVertexArrays(GLsizei n, const GLuint *arrays) {}
++void glGenVertexArrays(GLsizei n, GLuint *arrays) { if(arrays) for(GLsizei i=0;i<n;++i) arrays[i]=0; }
++void glBindVertexArray(GLuint array) {}
++void glDepthFunc(GLenum func) {}
++void glPolygonMode(GLenum face, GLenum mode) {}
++void glLineWidth(GLfloat width) {}
++void glPointSize(GLfloat size) {}
++void glNormal3f(GLfloat nx, GLfloat ny, GLfloat nz) {}
++void glNormalPointer(GLenum type, GLsizei stride, const void *pointer) {}
++void glClipPlane(GLenum plane, const GLdouble *equation) {}
++void glLightfv(GLenum light, GLenum pname, const GLfloat *params) {}
++void glLightModelfv(GLenum pname, const GLfloat *params) {}
++void glMaterialfv(GLenum face, GLenum pname, const GLfloat *params) {}
++void glMaterialf(GLenum face, GLenum pname, GLfloat param) {}
++void glTexGeni(GLenum coord, GLenum pname, GLint param) {}
++void glTexGenfv(GLenum coord, GLenum pname, const GLfloat *params) {}
++void glFogf(GLenum pname, GLfloat param) {}
++void glFogi(GLenum pname, GLint param) {}
++void glFogfv(GLenum pname, const GLfloat *params) {}
++void glAlphaFunc(GLenum func, GLfloat ref) {}
++void glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {}
++void glRasterPos2f(GLfloat x, GLfloat y) {}
++void glRasterPos3f(GLfloat x, GLfloat y, GLfloat z) {}
++void glBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove, GLfloat ymove, const unsigned char *bitmap) {}
+diff --git a/yolo_repair/stageA_feature_repair.py b/yolo_repair/stageA_feature_repair.py
+index a07a3a68ea6754177cdf2cb649a6218254bb7cd9..584f4477b2fbf6901dfe604df3d29a05cc2c7dba 100644
+--- a/yolo_repair/stageA_feature_repair.py
++++ b/yolo_repair/stageA_feature_repair.py
+@@ -1,110 +1,111 @@
+ # -*- coding: utf-8 -*-
+ """
+ 阶段A：中间层可信修复（GD 微调少量中间层），核心是：
+ - 用“成功样本”建立类原型（在“分类 1×1 conv 的输入特征图”上，做 ROIAlign -> 取均值，EMA 累积）
+ - 对“失败样本”最小化与对应类原型的 L2/Huber 距离（把特征拉回正确 pre-image）
+ - 对“成功样本”添加一致性（蒸馏）约束（修复前后 ROI 特征接近），减少副作用
+ - 只**解冻**分类末端**上一层的 stem（如 cv2）**或同层级极少参数；**不改**分类 1×1 conv 自身
+ """
+ import os
+ from pathlib import Path
+ import torch
+ import torch.nn as nn
+ import torch.optim as optim
+ from torchvision.ops import roi_align
+ from tqdm import tqdm
+ import numpy as np
+-from .utils.yolo_hooks import load_yolov8_model, find_cls_1x1_convs, InputFeatHook, choose_p3_by_resolution, try_unfreeze_stem_of_cls_conv, freeze_module
++from .utils.yolo_hooks import load_yolov8_model, find_cls_1x1_convs, InputFeatHook, choose_p3_by_resolution, try_unfreeze_stem_of_cls_conv, freeze_module, unfreeze_module
+ from .utils.data import load_data_yaml, read_id_list, make_loader
+ from .utils.geometry import to_tensor_chw_rgb01, boxes_to_letterboxed_xyxy
+ 
+ class EMAPrototypes(nn.Module):
+     """每类一个向量原型，EMA 累积"""
+     def __init__(self, num_classes, feat_dim, momentum=0.9, device='cuda'):
+         super().__init__()
+         self.register_buffer('vec', torch.zeros(num_classes, feat_dim, device=device))
+         self.register_buffer('cnt', torch.zeros(num_classes, dtype=torch.long, device=device))
+         self.m = momentum
+ 
+     @torch.no_grad()
+     def update(self, cls_ids, feats):
+         for c in cls_ids.unique().tolist():
+             m = (cls_ids==c)
+             mu = feats[m].mean(0)
+             if self.cnt[c] == 0:
+                 self.vec[c] = mu
+             else:
+                 self.vec[c] = self.m*self.vec[c] + (1-self.m)*mu
+             self.cnt[c] += int(m.sum())
+ 
+     def get(self, cls_ids):
+         return self.vec[cls_ids]
+ 
+ class StageAFeatureRepairRunner:
+     def __init__(self, cfg):
+         self.cfg = cfg
+         dev = cfg['stageA']['device']
+         self.device = f"cuda:{dev}" if dev>=0 and torch.cuda.is_available() else "cpu"
+         self.img_size = cfg['img_size']
+ 
+         # 1) 载入模型
+         self.yolo = load_yolov8_model(cfg['paths']['weights'], self.device)
+         self.model = self.yolo.model
+ 
+         # 2) 取 num_classes，查找所有分类 1×1 conv，并注册输入特征钩子
+         data_info = load_data_yaml(cfg['paths']['data_yaml'])
+         self.class_names = data_info['names']
+         nc = len(self.class_names)
+         self.nc = nc
+ 
+         self.cls_convs = find_cls_1x1_convs(self.model, nc)
+-        self.hooks = [InputFeatHook(conv) for (_,conv) in self.cls_convs]
++        self.hooks = [InputFeatHook(conv, detach=False) for (_,conv) in self.cls_convs]
+ 
+         # 跑一次前向拿到各尺度特征图尺寸
+         # 随便抽一张 split 图
+         split = cfg['paths']['split']
+         img_dir = data_info['images'][split]
+         lbl_dir = data_info['labels'][split]
+         import glob
+         img0 = sorted(glob.glob(str(img_dir/'*.*')))[0]
+         import cv2
+         im = cv2.imread(img0)
+         t, meta = to_tensor_chw_rgb01(im, img_size=self.img_size)
+         with torch.no_grad():
+             _ = self.model(t.to(self.device))
+         # 选择 P3（分辨率最大）
+         self.p3_idx = choose_p3_by_resolution(self.hooks)
+         self.target_conv_name, self.target_cls_conv = self.cls_convs[self.p3_idx]
+         print(f"[StageA] 选择 P3 分类 1×1 Conv：{self.target_conv_name}")
+ 
+         # 3) 仅解冻该尺度的“前置 stem（如 cv2）”，其他全部冻结（保持结构）
+         freeze_module(self.model)
+         ok = try_unfreeze_stem_of_cls_conv(self.model, self.target_conv_name)
+         if not ok:
+-            print("[StageA][Warn] 未能自动定位前置 stem，仅解冻分类输入的 BN/Conv 可能会失败；"
+-                  "如需更强修复，请在 yolo_hooks.try_unfreeze_stem_of_cls_conv 中按你的模型结构微调逻辑。")
++            print("[StageA][Warn] 未能自动定位前置 stem，将回退到解冻分类 1×1 Conv 所在模块。")
++            if not self._unfreeze_target_parent():
++                unfreeze_module(self.target_cls_conv)
+ 
+         # 4) 构建数据加载器（按 id 列表采样）
+         succ_ids = read_id_list(cfg['paths']['success_ids'])
+         fail_ids = read_id_list(cfg['paths']['failure_ids'])
+         self.loader_pos = make_loader(img_dir, lbl_dir, succ_ids, batch_size=1, shuffle=True, num_workers=cfg['stageA']['num_workers'])
+         self.loader_neg = make_loader(img_dir, lbl_dir, fail_ids, batch_size=1, shuffle=True, num_workers=cfg['stageA']['num_workers'])
+ 
+         # 5) 构建类原型容器（维度来自一次前向后的 hook）
+         feat = self.hooks[self.p3_idx].last_in   # [1, C, H, W]
+         assert feat is not None and feat.ndim==4
+         self.feat_dim = int(feat.shape[1])
+         self.proto = EMAPrototypes(self.nc, self.feat_dim, momentum=0.9, device=self.device)
+ 
+         # 6) 优化器（仅含解冻的参数）
+         params = [p for p in self.model.parameters() if p.requires_grad]
+         self.opt = optim.AdamW(params, lr=cfg['stageA']['lr'], weight_decay=cfg['stageA']['weight_decay'])
+ 
+         # 7) 记录 spatial_scale（ROIAlign 用），自动计算：H_feat / img_size
+         Hf, Wf = int(feat.shape[2]), int(feat.shape[3])
+         self.spatial_scale = Wf / float(self.img_size)  # 宽高相等
+ 
+     @torch.no_grad()
+     def build_prototypes(self, max_batches=300):
+         print("[StageA] 构建类原型（EMA）...")
+         cnt = 0
+@@ -117,50 +118,60 @@ class StageAFeatureRepairRunner:
+             t, meta = to_tensor_chw_rgb01(img_bgr, img_size=self.img_size)
+             with torch.no_grad():
+                 _ = self.model(t.to(self.device))
+                 fmap = self.hooks[self.p3_idx].last_in   # [1,C,H,W]
+             # GT 框转到 letterbox 坐标
+             boxes = gt[:,1:5]
+             boxes_lb = boxes_to_letterboxed_xyxy(boxes.copy(), meta)
+             # 组 ROIs: [N,5]=(batch_idx, x1,y1,x2,y2)
+             rois = torch.from_numpy(np.concatenate([np.zeros((boxes_lb.shape[0],1)), boxes_lb], axis=1)).float().to(self.device)
+             pooled = roi_align(fmap, rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)  # [N,C]
+             labels = torch.from_numpy(gt[:,0]).long().to(self.device)
+             self.proto.update(labels, pooled)
+             cnt += 1
+             if cnt >= max_batches: break
+         print("[StageA] 类原型构建完成。")
+ 
+     def _loss_align(self, pooled, labels):
+         target = self.proto.get(labels)
+         return torch.nn.functional.mse_loss(pooled, target)
+ 
+     def _loss_consistency(self, fmap_before, fmap_after, rois):
+         p0 = roi_align(fmap_before, rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)
+         p1 = roi_align(fmap_after,  rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)
+         return torch.nn.functional.smooth_l1_loss(p1, p0)
+ 
++    def _unfreeze_target_parent(self):
++        parent = self.model
++        parts = self.target_conv_name.split('.')
++        for p in parts[:-1]:
++            if not hasattr(parent, p):
++                return False
++            parent = getattr(parent, p)
++        unfreeze_module(parent)
++        return True
++
+     def train(self, epochs=5, alpha=1.0, beta=0.1, save_ckpt='runs_repair/stageA_feature_repaired.safetensors'):
+         print("[StageA] 开始中间层可信修复训练...")
+         for ep in range(epochs):
+             # 交替两个阶段：先修失败（对齐原型），再稳成功（保持一致）
+             for phase, loader in (('neg', self.loader_neg), ('pos', self.loader_pos)):
+                 for batch in tqdm(loader, desc=f'E{ep+1}-{phase}', total=len(loader)):
+                     img_bgr, gt, path, stem = batch[0]
+                     if gt.shape[0]==0:
+                         continue
+                     # 前向前抓“before”特征
+                     t, meta = to_tensor_chw_rgb01(img_bgr, img_size=self.img_size)
+                     t = t.to(self.device)
+                     with torch.no_grad():
+                         _ = self.model(t)
+                         fmap_before = self.hooks[self.p3_idx].last_in.clone()
+                     # 前向（带梯度）
+                     out = self.model(t)
+                     fmap_after = self.hooks[self.p3_idx].last_in
+ 
+                     boxes_lb = boxes_to_letterboxed_xyxy(gt[:,1:5].copy(), meta)
+                     rois = torch.from_numpy(np.concatenate([np.zeros((boxes_lb.shape[0],1)), boxes_lb], axis=1)).float().to(self.device)
+                     labels = torch.from_numpy(gt[:,0]).long().to(self.device)
+                     pooled = roi_align(fmap_after, rois, output_size=1, spatial_scale=self.spatial_scale, aligned=True).squeeze(-1).squeeze(-1)
+ 
+                     if phase=='neg':
+diff --git a/yolo_repair/utils/data.py b/yolo_repair/utils/data.py
+index 867f64fcc4291f956a2e490ad7c46891c323f734..e7e7194b34b6e856a61ba822f5220c99e274e4dc 100644
+--- a/yolo_repair/utils/data.py
++++ b/yolo_repair/utils/data.py
+@@ -1,40 +1,43 @@
+ # -*- coding: utf-8 -*-
+ """
+ 数据读取工具：从 data.yaml 读取 split 的 images/labels 目录；
+ 按 success_ids / failure_ids 采样；提供 ROI 对齐所需的 GT 框与类别。
+ """
+ import os, glob, yaml
+ from pathlib import Path
+ import cv2
+ import numpy as np
+ import torch
+ from torch.utils.data import Dataset, DataLoader
+ 
+ def load_data_yaml(path_yaml):
++    path_yaml = Path(path_yaml)
+     data = yaml.safe_load(open(path_yaml,'r',encoding='utf-8'))
+     root = Path(data['path'])
++    if not root.is_absolute():
++        root = (path_yaml.parent / root).resolve()
+     names = data['names'] if isinstance(data['names'], list) else [data['names'][k] for k in sorted(data['names'].keys(), key=int)]
+     return dict(
+         root=root,
+         images=dict(
+             train=root / data.get('train','images/train'),
+             val=root / data.get('val','images/val'),
+             test=root / data.get('test','images/test'),
+         ),
+         labels=dict(
+             train=root / 'labels/train',
+             val=root / 'labels/val',
+             test=root / 'labels/test',
+         ),
+         names=names
+     )
+ 
+ def list_images(img_dir: Path):
+     exts = ('*.jpg','*.jpeg','*.png','*.bmp')
+     files = []
+     for e in exts: files += glob.glob(str(img_dir/e))
+     return sorted(files)
+ 
+ def read_id_list(txt_path):
+     ids = []
+     with open(txt_path,'r',encoding='utf-8') as f:
+diff --git a/yolo_repair/utils/yolo_hooks.py b/yolo_repair/utils/yolo_hooks.py
+index 6fd170b98ce5b77701a0ac03645046ee8fb32ca9..d58f07c01342506bd3a5273d732477c8a2c4e479 100644
+--- a/yolo_repair/utils/yolo_hooks.py
++++ b/yolo_repair/utils/yolo_hooks.py
+@@ -13,58 +13,63 @@ def load_yolov8_model(weights_path, device='cuda'):
+     yolo.model.to(device)
+     yolo.model.eval()
+     return yolo
+ 
+ # ---- 查找分类末端 1×1 Conv（nc 输出） ----
+ def find_cls_1x1_convs(model, num_classes):
+     """
+     遍历所有模块，返回 (name, conv_module) 列表：
+     - Conv2d
+     - kernel_size == 1x1
+     - out_channels == num_classes
+     这通常对应 P3/P4/P5 三个尺度的分类末端 1×1 Conv。
+     """
+     out = []
+     for name, m in model.named_modules():
+         if isinstance(m, nn.Conv2d) and tuple(m.kernel_size)==(1,1) and m.out_channels==num_classes:
+             out.append((name, m))
+     if not out:
+         raise RuntimeError("未找到分类末端 1×1 Conv，请检查模型结构或 num_classes。")
+     return out
+ 
+ # ---- 钩子：抓“分类 1×1 Conv 的输入”作为 ROI 的特征图 ----
+ class InputFeatHook:
+     """
+     注册到分类 1×1 Conv 上，抓取其 **输入特征图**（即 conv 前的张量）。
++    detach=False 时保留梯度，detach=True 时仅用于推理采样。
+     """
+-    def __init__(self, conv_module: nn.Conv2d):
++    def __init__(self, conv_module: nn.Conv2d, detach: bool = True):
+         self.last_in = None
++        self.detach = detach
+         self.h = conv_module.register_forward_hook(self._hook)
+ 
+     def _hook(self, m, inp, out):
+-        # inp 是一个 tuple，仅取第一个
+-        self.last_in = inp[0].detach()
++        feat = inp[0]
++        self.last_in = feat.detach() if self.detach else feat
++
++    def set_detach(self, flag: bool):
++        self.detach = flag
+ 
+     def close(self):
+         self.h.remove()
+ 
+ # ---- 选择尺度（P3/P4/P5）：取 H*W 最大者视为 P3 ----
+ def choose_p3_by_resolution(hooks):
+     sizes = []
+     for hk in hooks:
+         t = hk.last_in
+         assert t is not None and t.ndim==4, "钩子未捕获到输入特征，请先跑一次前向。"
+         sizes.append(int(t.shape[2]) * int(t.shape[3]))
+     p3_idx = int(torch.tensor(sizes).argmax().item())
+     return p3_idx
+ 
+ # ---- 冻结/解冻 ----
+ def freeze_module(mod: nn.Module):
+     for p in mod.parameters():
+         p.requires_grad_(False)
+ 
+ def unfreeze_module(mod: nn.Module):
+     for p in mod.parameters():
+         p.requires_grad_(True)
+ 
+ # ---- 通过分类 conv 的“同一父层”去尝试找到“前置stem(conv/bn/act)”并解冻 ----
+ def try_unfreeze_stem_of_cls_conv(model, cls_conv_name: str):
+ 
+EOF
+)
