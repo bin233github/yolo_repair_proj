@@ -1,0 +1,43 @@
+# 全局配置（可按需修改）
+paths:
+  weights: weights/best.pt
+  data_yaml: datasets/neu_det_yolo/neu_det.yaml
+  split: val                    # 从哪个 split 读样本列表（train/val/test），用于 StageA/B 的 ROI 取特征
+  success_ids: data/success_ids.txt
+  failure_ids: data/failure_ids.txt
+
+# 训练/推理图像尺寸
+img_size: 640
+
+# 阶段A：中间层可信修复（特征对齐）
+stageA:
+  device: 0                     # GPU id；CPU 用 -1
+  epochs: 5
+  batch_size: 1                 # ROI 对齐逐图处理即可
+  num_workers: 4
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  max_pos_batches: 300          # 构建类原型时最多累计批次数
+  alpha_align: 1.0              # 失败样本：向类原型对齐的损失权重
+  beta_consist: 0.1             # 成功样本：一致性（蒸馏）损失权重
+  target_scale: auto            # auto=自动选择 P3（特征图分辨率最大者）
+  save_ckpt: runs_repair/stageA_feature_repaired.safetensors
+
+# 阶段B：Head 末端 LP 线性修复（分类 1×1 Conv）
+stageB:
+  device: 0
+  m_fix: 0.6                    # 失败样本的分类 margin 阈值
+  m_keep: 0.2                   # 成功样本的保持 margin 阈值
+  l1_reg: 1.0                   # L1 最小化的权重（越大越偏向稀疏小改动）
+  max_fix: 6000                 # 失败样本用于 LP 的最多 ROI 数
+  max_keep: 6000                # 成功样本用于 LP 的最多 ROI 数
+  topk_out_channels: 16         # 只开放这几个输出通道作为变量（稳且可解释）；=0 表示全开放
+  save_pt: runs_repair/stageAB_yolov8_repaired.pt
+  save_certificate: runs_repair/lp_certificate.json
+
+# 可选：验证修复后指标
+verify:
+  device: 0
+  conf_thres: 0.25
+  iou_thres: 0.7
+  out_dir: runs_repair/verify
